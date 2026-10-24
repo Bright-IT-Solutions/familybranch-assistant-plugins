@@ -193,6 +193,8 @@ def check_openai_review(review)
   error("#{where}.test_cases", "exactly 5 positive and 3 negative (#{positive.size} and #{negative.size})") unless positive.size == 5 && negative.size == 3
   positive.each_with_index do |c, i|
     %w[description prompt tools_triggered expected_behavior].each { |key| error("#{where} positive #{i + 1}", "#{key} missing") if c[key].to_s.strip.empty? }
+    # The reviewer opens these: the review account's sample files, on the site
+    Array(c["file_attachment_urls"]).each { |url| https("#{where} positive #{i + 1} file_attachment_urls", url) }
   end
   negative.each_with_index do |c, i|
     %w[description prompt].each { |key| error("#{where} negative #{i + 1}", "#{key} missing") if c[key].to_s.strip.empty? }

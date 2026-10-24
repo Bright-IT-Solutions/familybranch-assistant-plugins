@@ -54,8 +54,9 @@ skills:
   characters; a portal category; https listing addresses; up to three
   starter prompts of at most 128 characters; a brand colour with 2:1 contrast
   against white; a square PNG logo and composer icon of 48 to 4,096 pixels;
-  exactly five positive and three negative review cases; release notes; one
-  server, `streamable-http`, OAuth by CIMD, with no headers.
+  exactly five positive and three negative review cases, a case's files at
+  https addresses; release notes; one server, `streamable-http`, OAuth by
+  CIMD, with no headers.
 
 `openai/mcp.json` puts the server's OAuth setting under
 `extensions.com.openai`, as OpenAI's packaging guide does, although the

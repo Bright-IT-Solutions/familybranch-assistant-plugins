@@ -65,7 +65,8 @@
               "description": "Keep a record on a deceased relative's profile",
               "prompt": "Save the attached birth record to Lucía Moreno's profile.",
               "tools_triggered": "search_people, add_person_document",
-              "expected_behavior": "Keeps the attached PDF on Lucía Moreno's profile as a birth record and says she has 2 document places left."
+              "expected_behavior": "Keeps the attached PDF on Lucía Moreno's profile as a birth record and says she has 2 document places left.",
+              "file_attachment_urls": ["https://familybranch.live/samples/lucia-moreno-birth-record-1925.pdf"]
             }
           ],
           "negative": [
