@@ -9,7 +9,7 @@
     "url": "https://familybranch.live"
   },
   "homepage": "https://familybranch.live/assistants",
-  "repository": "https://github.com/dlysenko/familybranch-assistant-plugins",
+  "repository": "https://github.com/Bright-IT-Solutions/familybranch-assistant-plugins",
   "license": "MIT",
   "keywords": ["family tree", "genealogy", "family history", "poster"],
   "extensions": {
