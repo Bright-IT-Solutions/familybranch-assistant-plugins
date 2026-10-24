@@ -1,0 +1,94 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "familybranch",
+  "version": "1.0.0",
+  "description": "Build your family tree in FamilyBranch from a conversation: add relatives with the dates you know, keep records and sources on their profiles, and make printable posters of the tree.",
+  "author": {
+    "name": "Bright IT Solutions",
+    "email": "info@brightitsolutions.biz",
+    "url": "https://familybranch.live"
+  },
+  "homepage": "https://familybranch.live/assistants",
+  "repository": "https://github.com/dlysenko/familybranch-assistant-plugins",
+  "license": "MIT",
+  "keywords": ["family tree", "genealogy", "family history", "poster"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "FamilyBranch",
+        "shortDescription": "Family trees, built together",
+        "longDescription": "FamilyBranch keeps a family's tree in one shared place that relatives build together. This plugin lets ChatGPT work on the trees your FamilyBranch account belongs to:\n\n- Add relatives and how they are related, with the dates you know: a year alone, or roughly (c. 1941).\n- Correct names, dates, places and parents, record couples, and add to a relative's notes with the source.\n- Keep records on a relative's profile: links to archive pages and memorials, and up to three documents, such as a birth record, a census page or a letter, for people who have died.\n- Set a relative's portrait from a photo you share.\n- See upcoming birthdays.\n- Make a printable PDF or JPEG poster of the tree in one of four styles, drawn around anyone in it, and get its download link.\n\nIt is for anyone keeping a family tree on FamilyBranch, from the family historian to the relative who remembers names nobody wrote down.\n\nLimitations: it needs a FamilyBranch account and works only on the trees you belong to, within your role there; a viewer reads and changes nothing. A family's admin can turn AI assistants off for the family. Documents can be added through ChatGPT only for people who have died; a living relative's papers are uploaded on FamilyBranch itself. FamilyBranch downloads a file only when you ask it to keep that file, one at a time; a web page is kept as a link, never scraped. The free plan holds 25 people and puts a small FamilyBranch mark on posters.",
+        "developerName": "Bright IT Solutions",
+        "category": "Productivity",
+        "capabilities": ["Read family trees", "Add and edit relatives", "Keep records and photos", "Make tree posters"],
+        "websiteURL": "https://familybranch.live",
+        "supportURL": "https://familybranch.live/assistants#support",
+        "privacyPolicyURL": "https://familybranch.live/privacy",
+        "termsOfServiceURL": "https://familybranch.live/terms",
+        "defaultPrompt": [
+          "Show me my family tree and who is in it.",
+          "Add my grandmother, born around 1941, as my mother's mother.",
+          "Make a PDF poster of my family tree."
+        ],
+        "brandColor": "#2E7D5B",
+        "composerIcon": "./assets/icon.png",
+        "logo": "./assets/icon.png"
+      },
+      "review": {
+        "test_cases": {
+          "positive": [
+            {
+              "description": "List the user's family trees",
+              "prompt": "Show me my family trees in FamilyBranch.",
+              "tools_triggered": "list_family_trees",
+              "expected_behavior": "Lists the Moreno family tree with its number of people and the reviewer's role in it."
+            },
+            {
+              "description": "Answer a question from the tree",
+              "prompt": "Who are Elena Moreno's parents and children?",
+              "tools_triggered": "search_people, get_person",
+              "expected_behavior": "Names Miguel and Halyna Moreno as her parents and Nina and Lukas Weber as her children, as the tree records them."
+            },
+            {
+              "description": "Add an ancestor with an approximate date",
+              "prompt": "Add Rosa as Antonio Moreno's mother, born around 1895 in Valencia.",
+              "tools_triggered": "search_people, add_person",
+              "expected_behavior": "Adds Rosa as Antonio Moreno's mother, born c. 1895 in Valencia, with no invented day or month."
+            },
+            {
+              "description": "Make a poster",
+              "prompt": "Make a PDF poster of my family tree in the Heritage style.",
+              "tools_triggered": "list_family_trees, create_poster_export, get_export_status",
+              "expected_behavior": "Starts a Heritage-style PDF poster of the Moreno family and, once it is ready, gives a download link that works for an hour."
+            },
+            {
+              "description": "Keep a record on a deceased relative's profile",
+              "prompt": "Save the attached birth record to Lucía Moreno's profile.",
+              "tools_triggered": "search_people, add_person_document",
+              "expected_behavior": "Keeps the attached PDF on Lucía Moreno's profile as a birth record and says she has 2 document places left."
+            }
+          ],
+          "negative": [
+            {
+              "description": "General knowledge about a surname, not the user's tree: answer without FamilyBranch.",
+              "prompt": "What is the origin of the surname Moreno?"
+            },
+            {
+              "description": "A fictional family, not the user's own: FamilyBranch is not used and nothing is added to a tree.",
+              "prompt": "Invent a family tree for the characters in my fantasy novel."
+            },
+            {
+              "description": "How to get a certificate from a registry office: general advice, with no FamilyBranch tool called.",
+              "prompt": "Explain how to request a birth certificate from a registry office."
+            }
+          ]
+        },
+        "commerce": false,
+        "commerce_description": "The plugin sells nothing and takes no payments."
+      },
+      "publication": {
+        "release_notes": "First release. Read family trees and upcoming birthdays; add, correct and delete relatives and couples; add to a relative's notes; keep links, documents and portraits on profiles; make poster exports. Three skills: build-family-tree, keep-family-records and make-a-poster."
+      }
+    }
+  }
+}

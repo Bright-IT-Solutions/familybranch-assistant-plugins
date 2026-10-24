@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Copies the skills (their source is skills/) and the licence into each
+# package. Real copies: Claude's directory refuses symlinked components, and
+# each package must be complete on its own.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+for package in claude openai; do
+  rsync -a --delete --exclude .DS_Store skills/ "$package/skills/"
+done
+cp LICENSE claude/LICENSE

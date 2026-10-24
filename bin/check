@@ -1,0 +1,265 @@
+#!/usr/bin/env ruby
+# Holds both packages to what the two portals check before they take a
+# submission (the rules are in README.md), so a refusal is found here and
+# not after an upload. Run before every commit; bin/package_openai runs it.
+require "json"
+require "yaml"
+require "open3"
+
+ROOT = File.expand_path("..", __dir__)
+MCP_URL = "https://familybranch.live/mcp"
+PACKAGES = %w[claude openai].freeze
+SKILL_NAME = /\A[a-z0-9]+(?:-[a-z0-9]+)*\z/
+SEMVER = /\A\d+\.\d+\.\d+\z/
+LITTER = %w[.DS_Store Thumbs.db desktop.ini __MACOSX].freeze
+IMAGE = /\.(png|jpe?g|gif|webp|svg|woff2?|ttf|otf)\z/i
+OPENAI_CATEGORIES = ["Productivity", "Creativity", "Developer Tools", "Business & Operations", "Data & Analytics",
+  "Communication", "Education & Research", "Security", "Finance", "Healthcare", "Travel", "Entertainment", "Other"].freeze
+
+@errors = []
+
+def error(where, message) = @errors << "#{where}: #{message}"
+
+def path(*parts) = File.join(ROOT, *parts)
+
+def files_under(dir)
+  Dir.glob("**/*", File::FNM_DOTMATCH, base: path(dir)).reject { |f| File.directory?(path(dir, f)) || f.end_with?("/.") || f == "." }.sort
+end
+
+def json(file)
+  JSON.parse(File.read(path(file)))
+rescue JSON::ParserError, Errno::ENOENT => e
+  error(file, "unreadable JSON (#{e.message.lines.first.strip})")
+  nil
+end
+
+def one_line_within(where, value, limit)
+  if !value.is_a?(String) || value.strip.empty?
+    error(where, "missing")
+  elsif value.length > limit || value.include?("\n")
+    error(where, "one line of at most #{limit} characters (#{value.length})")
+  end
+end
+
+def https(where, value)
+  error(where, "an https address without credentials (#{value.inspect})") unless value.is_a?(String) && value.match?(%r{\Ahttps://[^/@\s]+(/\S*)?\z})
+end
+
+# The skills' source: Claude's and OpenAI's frontmatter rules, which are the
+# Agent Skills specification's
+def check_skills
+  names = Dir.children(path("skills")).select { |d| File.directory?(path("skills", d)) }.sort
+  error("skills", "no skills") if names.empty?
+  names.each do |name|
+    file = "skills/#{name}/SKILL.md"
+    next error(file, "missing") unless File.file?(path(file))
+
+    text = File.read(path(file))
+    front, body = text.match(/\A---\n(.*?)\n---\n(.*)\z/m)&.captures
+    next error(file, "no YAML frontmatter between --- lines") unless front
+
+    meta = YAML.safe_load(front)
+    error(file, "frontmatter holds only name and description") unless meta.is_a?(Hash) && meta.keys.sort == %w[description name]
+    error(file, "name #{meta["name"].inspect} must be the folder's, #{name}") unless meta["name"] == name
+    error(file, "name: lowercase words joined by hyphens") unless name.match?(SKILL_NAME)
+    error(file, "familybranch:#{name} is over 64 characters") if "familybranch:#{name}".length > 64
+    one_line_within("#{file} description", meta["description"], 1024)
+    error(file, "no instructions") if body.to_s.strip.empty?
+    error(file, "over 500 lines") if body.lines.count >= 500
+    # Addresses come from the tools' answers, never from a skill
+    error(file, "holds a web address") if text.match?(%r{https?://})
+  end
+end
+
+# Each package carries a copy, byte for byte: bin/sync_skills makes them
+def check_copies
+  PACKAGES.each do |package|
+    next error("#{package}/skills", "differs from skills/: run bin/sync_skills") unless files_under("skills") == files_under("#{package}/skills")
+
+    files_under("skills").each do |f|
+      error("#{package}/skills/#{f}", "differs from skills/: run bin/sync_skills") unless File.binread(path("skills", f)) == File.binread(path(package, "skills", f))
+    end
+  end
+  error("claude/LICENSE", "differs from LICENSE: run bin/sync_skills") unless File.exist?(path("claude/LICENSE")) && File.read(path("LICENSE")) == File.read(path("claude/LICENSE"))
+end
+
+# Claude's directory takes only regular files, refuses system litter and
+# holds for a reviewer any non-image over 256 KiB or more than 512 files
+def check_files
+  (PACKAGES + ["skills"]).each do |dir|
+    files = files_under(dir)
+    error(dir, "more than 512 files") if files.size > 512
+    files.each do |f|
+      full = path(dir, f)
+      error("#{dir}/#{f}", "system litter") if f.split("/").any? { |part| LITTER.include?(part) }
+      error("#{dir}/#{f}", "a symlink") if File.symlink?(full)
+      error("#{dir}/#{f}", "over 256 KiB") if !f.match?(IMAGE) && File.size(full) > 256 * 1024
+    end
+  end
+end
+
+def check_claude
+  manifest = json("claude/.claude-plugin/plugin.json") or return
+  where = "claude/.claude-plugin/plugin.json"
+  error(where, "name: lowercase words joined by hyphens") unless manifest["name"].to_s.match?(SKILL_NAME)
+  error(where, "version: a semantic version") unless manifest["version"].to_s.match?(SEMVER)
+  one_line_within("#{where} description", manifest["description"], 4000)
+  one_line_within("#{where} author.name", manifest.dig("author", "name"), 120)
+  error(where, "license missing") unless manifest["license"] || File.exist?(path("claude/LICENSE"))
+  https("#{where} privacyPolicyUrl", manifest["privacyPolicyUrl"])
+  # The directory takes the icon once, when the plugin is first saved there
+  icon = manifest["icon"].to_s
+  width, height = png_size(path("claude", icon)) if icon.start_with?("./") && File.file?(path("claude", icon))
+  error("#{where} icon", "a square PNG of 512 to 2,048 pixels, under 2 MB") unless width && width == height && width.between?(512, 2048) && File.size(path("claude", icon)) < 2 * 1024 * 1024
+  error("claude/.claude-plugin", "holds only plugin.json") unless Dir.children(path("claude/.claude-plugin")) == ["plugin.json"]
+
+  servers = json("claude/.mcp.json")&.fetch("mcpServers", nil)
+  if !servers.is_a?(Hash) || servers.size != 1
+    error("claude/.mcp.json", "one server under mcpServers")
+  else
+    server = servers.values.first
+    error("claude/.mcp.json", "type http and url #{MCP_URL}, nothing else") unless server == {"type" => "http", "url" => MCP_URL}
+  end
+
+  # A top-level bin/ stops claude.ai from installing the plugin at all; the
+  # others would be code the directory reviews
+  %w[bin hooks commands agents].each { |dir| error("claude/#{dir}", "not in this plugin") if File.exist?(path("claude", dir)) }
+
+  readme = File.read(path("claude/README.md")) rescue ""
+  words = readme.gsub(/^```.*?^```/m, "").split.size
+  error("claude/README.md", "at least 40 words outside code blocks (#{words})") if words < 40
+end
+
+def png_size(file)
+  bytes = File.binread(file, 24)
+  return unless bytes&.start_with?("\x89PNG\r\n\x1A\n".b)
+
+  bytes[16, 8].unpack("NN")
+end
+
+def luminance(hex)
+  hex.delete("#").scan(/../).map { |c| c.to_i(16) / 255.0 }
+    .map { |c| (c <= 0.03928) ? c / 12.92 : ((c + 0.055) / 1.055)**2.4 }
+    .zip([0.2126, 0.7152, 0.0722]).sum { |c, w| c * w }
+end
+
+def check_openai_interface(interface)
+  where = "openai/plugin.json interface"
+  one_line_within("#{where}.displayName", interface["displayName"], 30)
+  one_line_within("#{where}.shortDescription", interface["shortDescription"], 30)
+  long = interface["longDescription"]
+  error("#{where}.longDescription", "required, at most 4,000 characters") unless long.is_a?(String) && !long.strip.empty? && long.length <= 4000
+  one_line_within("#{where}.developerName", interface["developerName"], 80)
+  error("#{where}.category", "one of the portal's categories") unless OPENAI_CATEGORIES.include?(interface["category"])
+
+  capabilities = Array(interface["capabilities"])
+  error("#{where}.capabilities", "at most 20") if capabilities.size > 20
+  capabilities.each { |c| one_line_within("#{where}.capabilities", c, 120) }
+
+  %w[websiteURL supportURL privacyPolicyURL termsOfServiceURL].each do |key|
+    https("#{where}.#{key}", interface[key])
+    error("#{where}.#{key}", "at most 1,024 characters") if interface[key].to_s.length > 1024
+  end
+
+  prompts = Array(interface["defaultPrompt"])
+  error("#{where}.defaultPrompt", "at most 3, all different") if prompts.size > 3 || prompts.map { |p| p.downcase.split.join(" ") }.uniq.size != prompts.size
+  prompts.each do |p|
+    one_line_within("#{where}.defaultPrompt", p, 128)
+    error("#{where}.defaultPrompt", "no @mention (#{p})") if p.include?("@")
+  end
+
+  color = interface["brandColor"]
+  if !color.to_s.match?(/\A#\h{6}\z/)
+    error("#{where}.brandColor", "a #RRGGBB colour")
+  elsif 1.05 / (luminance(color) + 0.05) < 2
+    error("#{where}.brandColor", "at least 2:1 against white")
+  end
+
+  %w[logo composerIcon].each do |key|
+    file = interface[key].to_s
+    next error("#{where}.#{key}", "a ./ path inside the package") unless file.start_with?("./") && !file.include?("..")
+
+    width, height = png_size(path("openai", file)) if File.exist?(path("openai", file))
+    error("#{where}.#{key}", "a square PNG of 48 to 4,096 pixels") unless width && width == height && width.between?(48, 4096)
+  end
+end
+
+def check_openai_review(review)
+  where = "openai/plugin.json review"
+  error(where, "no credentials or reviewer instructions in the package") if (review.keys & %w[test_credentials reviewer_instructions]).any?
+  cases = review["test_cases"] || {}
+  positive = Array(cases["positive"])
+  negative = Array(cases["negative"])
+  error("#{where}.test_cases", "exactly 5 positive and 3 negative (#{positive.size} and #{negative.size})") unless positive.size == 5 && negative.size == 3
+  positive.each_with_index do |c, i|
+    %w[description prompt tools_triggered expected_behavior].each { |key| error("#{where} positive #{i + 1}", "#{key} missing") if c[key].to_s.strip.empty? }
+  end
+  negative.each_with_index do |c, i|
+    %w[description prompt].each { |key| error("#{where} negative #{i + 1}", "#{key} missing") if c[key].to_s.strip.empty? }
+  end
+  error("#{where}.commerce", "false: the plugin sells nothing") unless review["commerce"] == false
+end
+
+def check_openai
+  manifest = json("openai/plugin.json") or return
+  where = "openai/plugin.json"
+  error(where, "$schema: the Agent Plugins 1.0.0 manifest") unless manifest["$schema"] == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+  extra = manifest.keys - %w[$schema name version description author homepage repository license keywords extensions]
+  error(where, "keys the Agent Plugins schema doesn't allow: #{extra.join(", ")}") if extra.any?
+  error(where, "name: lowercase words joined by hyphens") unless manifest["name"].to_s.match?(SKILL_NAME)
+  error(where, "version: a semantic version") unless manifest["version"].to_s.match?(SEMVER)
+  error(where, "author holds only name, email and url") unless manifest["author"].is_a?(Hash) && (manifest["author"].keys - %w[name email url]).empty?
+  https("#{where} author.url", manifest.dig("author", "url"))
+
+  openai = manifest.dig("extensions", "com.openai") || {}
+  extra = openai.keys - %w[interface review publication]
+  error(where, "com.openai holds interface, review and publication only, never apps or hooks (#{extra.join(", ")})") if extra.any?
+  check_openai_interface(openai["interface"] || {})
+  check_openai_review(openai["review"] || {})
+  error("#{where} publication.release_notes", "always filled") if openai.dig("publication", "release_notes").to_s.strip.empty?
+
+  mcp = json("openai/mcp.json") or return
+  error("openai/mcp.json", "$schema: the Agent Plugins 1.0.0 MCP configuration") unless mcp["$schema"] == "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
+  servers = mcp["mcpServers"]
+  if !servers.is_a?(Hash) || servers.size != 1
+    error("openai/mcp.json", "one server under mcpServers: the portal connects one")
+  else
+    server = servers.values.first
+    error("openai/mcp.json", "type streamable-http and url #{MCP_URL}") unless server["type"] == "streamable-http" && server["url"] == MCP_URL
+    error("openai/mcp.json", "no headers: the portal refuses them") if server.key?("headers")
+    error("openai/mcp.json", "auth: OAuth, client by CIMD") unless server.dig("extensions", "com.openai", "auth") == {"type" => "oauth", "client" => {"mode" => "cimd"}}
+  end
+
+  %w[.app.json .mcp.json .codex-plugin hooks].each { |f| error("openai/#{f}", "not in this package") if File.exist?(path("openai", f)) }
+end
+
+def check_together
+  claude = json("claude/.claude-plugin/plugin.json") || {}
+  openai = json("openai/plugin.json") || {}
+  %w[name version description].each do |key|
+    error("plugin.json #{key}", "the same in both packages") unless claude[key] == openai[key]
+  end
+end
+
+def check_with_claude_code
+  _, status = Open3.capture2e("which", "claude")
+  return puts("claude not installed: skipped claude plugin validate") unless status.success?
+
+  output, = Open3.capture2e("claude", "plugin", "validate", path("claude"))
+  error("claude plugin validate", output.strip) unless output.include?("Validation passed")
+end
+
+check_skills
+check_copies
+check_files
+check_claude
+check_openai
+check_together
+check_with_claude_code
+
+if @errors.empty?
+  puts "✔ Both packages pass"
+else
+  puts @errors
+  exit 1
+end

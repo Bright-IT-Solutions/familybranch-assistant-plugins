@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# The ZIP the OpenAI portal takes: openai/'s contents at the archive root,
+# with no macOS litter, after every check has passed.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+bin/check
+version=$(ruby -rjson -e 'print JSON.parse(File.read("openai/plugin.json")).fetch("version")')
+zip_path="dist/familybranch-openai-$version.zip"
+mkdir -p dist
+rm -f "$zip_path"
+(cd openai && zip -q -r -X "../$zip_path" . -x '*.DS_Store' -x '__MACOSX/*')
+echo "$zip_path"

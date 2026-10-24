@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "familybranch": {
+      "type": "http",
+      "url": "https://familybranch.live/mcp"
+    }
+  }
+}
