@@ -6,8 +6,9 @@ to the same server, `https://familybranch.live/mcp`, and carry the same three
 skills:
 
 - **build-family-tree**: add relatives one generation at a time, with dates
-  only as precise as the user gives them, and change or remove people with
-  the user's yes.
+  only as precise as the user gives them; before replacing or clearing what
+  the tree holds, or removing someone, show the user what changes and wait
+  for their yes.
 - **keep-family-records**: keep record pages as links and records as
   documents on a relative's profile, with the source in the notes.
 - **make-a-poster**: make a printable PDF or JPEG poster of the tree and hand

@@ -22,7 +22,8 @@ The plugin holds three skills, which teach Claude the way FamilyBranch works:
 
 - **build-family-tree**: finds the right person before adding anyone, adds one
   generation at a time, records dates only as precisely as you give them, and
-  asks before deleting someone or replacing what the tree holds.
+  before it replaces or clears what the tree holds, or deletes someone, shows
+  you what changes and waits for your yes.
 - **keep-family-records**: keeps a record's page as a link and the record
   itself as a document, for people who have died, and names the source in the
   notes.

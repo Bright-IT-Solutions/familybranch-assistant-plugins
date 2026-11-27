@@ -17,7 +17,7 @@ The user's own instructions come first; what follows is the default way to work.
 
 ## Add relatives
 
-3. Search for each new person's name before adding them. When someone already in the tree fits, connect them instead: `update_person` with `father_id` or `mother_id`, or `set_partnership`.
+3. Search for each new person's name before adding them. When someone already in the tree fits, connect them instead: `update_person` with `father_id` or `mother_id`, or `set_partnership`. Setting a parent where the tree already has one replaces that parent: step 6 applies.
 4. Add one generation at a time, parents before grandparents, each with `add_person`, `relative_of` and `relation`. The new `person_id` is the anchor for the next generation.
    - `gender` decides whether a parent takes the father or the mother place. When the user hasn't said, ask, or leave it out and the free place is taken.
    - A child of someone with several partners needs `other_parent_id`.
@@ -27,7 +27,10 @@ The user's own instructions come first; what follows is the default way to work.
 
 ## Change and remove
 
-6. `update_person` changes only the fields you give, and null clears one. When a change overwrites something the tree already has (a name, a date, a place, a parent), say what it was and what it becomes.
+6. `update_person` changes only the fields you give, and null clears one. Before a change that could replace or clear a value (a name, a date, a place, a parent), call `get_person` and read what the field holds now. For a parent, name both the parent recorded now and the new one, and find the new one as in step 2.
+   - An empty field takes the new value.
+   - When the user has already approved this replacement for this person, naming the value it holds now and the new one, make it.
+   - Otherwise show the person with their `lifespan`, the field, what it holds and what it would become, and wait for the user's yes before calling `update_person`. When they say no, change nothing.
 7. Its `notes` replaces all of the family's notes. Add to the notes with `append_note`; replace them only when the user asks for exactly that.
 8. `delete_person` removes the person with their partnerships, links, documents and any saved branch drawn around them, and can't be undone. Name the person with their `lifespan` and get the user's yes before each call, one person at a time.
 
