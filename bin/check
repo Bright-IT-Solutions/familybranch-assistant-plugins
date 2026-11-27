@@ -1,10 +1,12 @@
 #!/usr/bin/env ruby
 # Holds both packages to what the two portals check before they take a
 # submission (the rules are in README.md), so a refusal is found here and
-# not after an upload. Run before every commit; bin/package_openai runs it.
+# not after an upload. Run before every commit; bin/package_openai runs the
+# copy of it in the commit it packages, on that commit's files.
 require "json"
 require "yaml"
 require "open3"
+require_relative "../lib/inventory"
 
 ROOT = File.expand_path("..", __dir__)
 MCP_URL = "https://familybranch.live/mcp"
@@ -13,6 +15,15 @@ SKILL_NAME = /\A[a-z0-9]+(?:-[a-z0-9]+)*\z/
 SEMVER = /\A\d+\.\d+\.\d+\z/
 LITTER = %w[.DS_Store Thumbs.db desktop.ini __MACOSX].freeze
 IMAGE = /\.(png|jpe?g|gif|webp|svg|woff2?|ttf|otf)\z/i
+KINDS = {"link" => "a symlink", "fifo" => "a FIFO", "socket" => "a socket", "characterSpecial" => "a device",
+  "blockSpecial" => "a device"}.freeze
+# The Claude manifest keys this release uses. Any other key would declare
+# something more for Claude to load or run (hooks, commands, agents, MCP or
+# LSP servers), so adding one is a reviewed change to this list.
+CLAUDE_KEYS = %w[name displayName version description author homepage privacyPolicyUrl repository license keywords
+  icon].freeze
+CLAUDE_ICON = "assets/icon.png"
+CLAUDE_SERVER = {"type" => "http", "url" => MCP_URL}.freeze
 OPENAI_CATEGORIES = ["Productivity", "Creativity", "Developer Tools", "Business & Operations", "Data & Analytics",
   "Communication", "Education & Research", "Security", "Finance", "Healthcare", "Travel", "Entertainment", "Other"].freeze
 
@@ -22,8 +33,52 @@ def error(where, message) = @errors << "#{where}: #{message}"
 
 def path(*parts) = File.join(ROOT, *parts)
 
-def files_under(dir)
-  Dir.glob("**/*", File::FNM_DOTMATCH, base: path(dir)).reject { |f| File.directory?(path(dir, f)) || f.end_with?("/.") || f == "." }.sort
+def kind(stat) = KINDS.fetch(stat.ftype, "a #{stat.ftype}")
+
+# Runs first, and nothing is read until it passes. Every package folder and
+# every entry in it is looked at with lstat, which never follows a link: a
+# symlink, to a file or a folder, could point anywhere on the maintainer's
+# disk (and zip follows one), and reading a FIFO never ends. Then each folder
+# must hold exactly the files lib/inventory.rb lists.
+def check_tree
+  INVENTORY.each do |root, expected|
+    stat = File.lstat(path(root)) rescue nil
+    next error(root, stat ? "#{kind(stat)}, not a folder" : "missing") unless stat&.directory?
+
+    found = regular_files(root)
+    (expected - found).each do |f|
+      synced = root != "skills" && (f.start_with?("skills/") || f == "LICENSE")
+      error("#{root}/#{f}", synced ? "missing: run bin/sync_skills" : "missing")
+    end
+    (found - expected).each do |f|
+      litter = f.split("/").any? { |part| LITTER.include?(part) }
+      error("#{root}/#{f}", litter ? "system litter: delete it" : "not in lib/inventory.rb, which lists all a package ships")
+    end
+  end
+end
+
+# The regular files under a package folder. Anything else is an error, and
+# is neither opened nor entered.
+def regular_files(root, dir = nil, found = [])
+  Dir.children(path(root, *dir)).sort.each do |name|
+    entry = [dir, name].compact.join("/")
+    stat = File.lstat(path(root, entry))
+    if stat.file?
+      found << entry
+    elsif stat.directory?
+      regular_files(root, entry, found)
+    else
+      error("#{root}/#{entry}", "#{kind(stat)}: packages hold regular files only")
+    end
+  end
+  found
+end
+
+def stop_on_errors
+  return if @errors.empty?
+
+  puts @errors
+  exit 1
 end
 
 def json(file)
@@ -48,12 +103,8 @@ end
 # The skills' source: Claude's and OpenAI's frontmatter rules, which are the
 # Agent Skills specification's
 def check_skills
-  names = Dir.children(path("skills")).select { |d| File.directory?(path("skills", d)) }.sort
-  error("skills", "no skills") if names.empty?
-  names.each do |name|
+  SKILLS.each do |name|
     file = "skills/#{name}/SKILL.md"
-    next error(file, "missing") unless File.file?(path(file))
-
     text = File.read(path(file))
     front, body = text.match(/\A---\n(.*?)\n---\n(.*)\z/m)&.captures
     next error(file, "no YAML frontmatter between --- lines") unless front
@@ -74,33 +125,27 @@ end
 # Each package carries a copy, byte for byte: bin/sync_skills makes them
 def check_copies
   PACKAGES.each do |package|
-    next error("#{package}/skills", "differs from skills/: run bin/sync_skills") unless files_under("skills") == files_under("#{package}/skills")
-
-    files_under("skills").each do |f|
-      error("#{package}/skills/#{f}", "differs from skills/: run bin/sync_skills") unless File.binread(path("skills", f)) == File.binread(path(package, "skills", f))
+    SKILLS.each do |name|
+      file = "skills/#{name}/SKILL.md"
+      error("#{package}/#{file}", "differs from #{file}: run bin/sync_skills") unless File.binread(path(file)) == File.binread(path(package, file))
     end
   end
-  error("claude/LICENSE", "differs from LICENSE: run bin/sync_skills") unless File.exist?(path("claude/LICENSE")) && File.read(path("LICENSE")) == File.read(path("claude/LICENSE"))
+  error("claude/LICENSE", "differs from LICENSE: run bin/sync_skills") unless File.read(path("LICENSE")) == File.read(path("claude/LICENSE"))
 end
 
-# Claude's directory takes only regular files, refuses system litter and
-# holds for a reviewer any non-image over 256 KiB or more than 512 files
-def check_files
-  (PACKAGES + ["skills"]).each do |dir|
-    files = files_under(dir)
-    error(dir, "more than 512 files") if files.size > 512
-    files.each do |f|
-      full = path(dir, f)
-      error("#{dir}/#{f}", "system litter") if f.split("/").any? { |part| LITTER.include?(part) }
-      error("#{dir}/#{f}", "a symlink") if File.symlink?(full)
-      error("#{dir}/#{f}", "over 256 KiB") if !f.match?(IMAGE) && File.size(full) > 256 * 1024
-    end
+# Claude's directory holds for a reviewer any non-image over 256 KiB
+def check_sizes
+  INVENTORY.each do |root, files|
+    files.each { |f| error("#{root}/#{f}", "over 256 KiB") if !f.match?(IMAGE) && File.size(path(root, f)) > 256 * 1024 }
   end
 end
 
 def check_claude
-  manifest = json("claude/.claude-plugin/plugin.json") or return
   where = "claude/.claude-plugin/plugin.json"
+  manifest = json(where) or return
+  return error(where, "a JSON object") unless manifest.is_a?(Hash)
+
+  (manifest.keys - CLAUDE_KEYS).each { |key| error("#{where} #{key}", "not a key this release uses (CLAUDE_KEYS in bin/check)") }
   error(where, "name: lowercase words joined by hyphens") unless manifest["name"].to_s.match?(SKILL_NAME)
   error(where, "version: a semantic version") unless manifest["version"].to_s.match?(SEMVER)
   one_line_within("#{where} description", manifest["description"], 4000)
@@ -108,26 +153,36 @@ def check_claude
   error(where, "license missing") unless manifest["license"] || File.exist?(path("claude/LICENSE"))
   https("#{where} privacyPolicyUrl", manifest["privacyPolicyUrl"])
   # The directory takes the icon once, when the plugin is first saved there
-  icon = manifest["icon"].to_s
-  width, height = png_size(path("claude", icon)) if icon.start_with?("./") && File.file?(path("claude", icon))
-  error("#{where} icon", "a square PNG of 512 to 2,048 pixels, under 2 MB") unless width && width == height && width.between?(512, 2048) && File.size(path("claude", icon)) < 2 * 1024 * 1024
-  error("claude/.claude-plugin", "holds only plugin.json") unless Dir.children(path("claude/.claude-plugin")) == ["plugin.json"]
-
-  servers = json("claude/.mcp.json")&.fetch("mcpServers", nil)
-  if !servers.is_a?(Hash) || servers.size != 1
-    error("claude/.mcp.json", "one server under mcpServers")
+  icon = manifest["icon"]
+  if icon.is_a?(String) && icon.start_with?("./") && File.expand_path(icon, path("claude")) == path("claude", CLAUDE_ICON)
+    width, height = png_size(path("claude", CLAUDE_ICON))
+    error("#{where} icon", "a square PNG of 512 to 2,048 pixels, under 2 MB") unless width && width == height && width.between?(512, 2048) && File.size(path("claude", CLAUDE_ICON)) < 2 * 1024 * 1024
   else
-    server = servers.values.first
-    error("claude/.mcp.json", "type http and url #{MCP_URL}, nothing else") unless server == {"type" => "http", "url" => MCP_URL}
+    error("#{where} icon", "./#{CLAUDE_ICON}, the packaged icon (#{icon.inspect})")
   end
 
-  # A top-level bin/ stops claude.ai from installing the plugin at all; the
-  # others would be code the directory reviews
-  %w[bin hooks commands agents].each { |dir| error("claude/#{dir}", "not in this plugin") if File.exist?(path("claude", dir)) }
-
-  readme = File.read(path("claude/README.md")) rescue ""
+  readme = File.read(path("claude/README.md"))
   words = readme.gsub(/^```.*?^```/m, "").split.size
   error("claude/README.md", "at least 40 words outside code blocks (#{words})") if words < 40
+end
+
+# The plugin's one server, by name, transport and address
+def check_claude_mcp
+  where = "claude/.mcp.json"
+  mcp = json(where) or return
+  return error(where, "a JSON object") unless mcp.is_a?(Hash)
+
+  (mcp.keys - ["mcpServers"]).each { |key| error("#{where} #{key}", "not allowed: the file holds mcpServers only") }
+  servers = mcp["mcpServers"]
+  return error("#{where} mcpServers", "an object holding the familybranch server") unless servers.is_a?(Hash)
+
+  (servers.keys - ["familybranch"]).each { |name| error("#{where} mcpServers.#{name}", "a server this plugin doesn't declare: familybranch is its only one") }
+  server = servers["familybranch"]
+  return error("#{where} mcpServers.familybranch", "missing") unless server.is_a?(Hash)
+
+  (server.keys | CLAUDE_SERVER.keys).reject { |key| server[key] == CLAUDE_SERVER[key] }.each do |key|
+    error("#{where} mcpServers.familybranch.#{key}", "#{server[key].inspect}: the server is type http at #{MCP_URL}, with nothing else")
+  end
 end
 
 def png_size(file)
@@ -231,8 +286,6 @@ def check_openai
     error("openai/mcp.json", "no headers: the portal refuses them") if server.key?("headers")
     error("openai/mcp.json", "auth: OAuth, client by CIMD") unless server.dig("extensions", "com.openai", "auth") == {"type" => "oauth", "client" => {"mode" => "cimd"}}
   end
-
-  %w[.app.json .mcp.json .codex-plugin hooks].each { |f| error("openai/#{f}", "not in this package") if File.exist?(path("openai", f)) }
 end
 
 def check_together
@@ -243,25 +296,24 @@ def check_together
   end
 end
 
+# Optional, on top of the checks above, which run either way
 def check_with_claude_code
   _, status = Open3.capture2e("which", "claude")
-  return puts("claude not installed: skipped claude plugin validate") unless status.success?
+  return puts("claude not installed: skipped claude plugin validate (the other checks ran)") unless status.success?
 
-  output, = Open3.capture2e("claude", "plugin", "validate", path("claude"))
-  error("claude plugin validate", output.strip) unless output.include?("Validation passed")
+  output, status = Open3.capture2e("claude", "plugin", "validate", path("claude"))
+  error("claude plugin validate", "failed (exit #{status.exitstatus || status}):\n#{output.strip}") unless status.success?
 end
 
+check_tree
+stop_on_errors
 check_skills
 check_copies
-check_files
+check_sizes
 check_claude
+check_claude_mcp
 check_openai
 check_together
 check_with_claude_code
-
-if @errors.empty?
-  puts "✔ Both packages pass"
-else
-  puts @errors
-  exit 1
-end
+stop_on_errors
+puts "✔ Both packages pass"

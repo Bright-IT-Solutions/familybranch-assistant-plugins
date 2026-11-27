@@ -1,0 +1,329 @@
+#!/usr/bin/env ruby
+# Regression tests for bin/check and bin/package_openai. Each test copies
+# this checkout (tracked and untracked files, not ignored ones) into a new
+# git repository in a temporary folder, changes it there, and runs a script
+# with a PATH holding only the tools the scripts use. Claude Code's validator
+# joins in only where a test says so, and those tests are skipped without it.
+#
+# Symlinks point at FIFOs, which block whoever opens them, and at folders
+# that can't be listed: a script that ends has read none of them.
+require "minitest/autorun"
+require "fileutils"
+require "json"
+require "open3"
+require "rbconfig"
+require "tmpdir"
+
+ROOT = File.expand_path("..", __dir__)
+# The files the OpenAI ZIP ships, at the paths it has always had them
+OPENAI_FILES = %w[assets/icon.png mcp.json plugin.json skills/build-family-tree/SKILL.md
+  skills/keep-family-records/SKILL.md skills/make-a-poster/SKILL.md].freeze
+TOOLS = %w[git tar zip unzip which].freeze
+TIME_LIMIT = 30
+
+def find_tool(name)
+  ENV["PATH"].split(File::PATH_SEPARATOR).map { |dir| File.join(dir, name) }.find { |f| File.file?(f) && File.executable?(f) }
+end
+
+class ReleaseTest < Minitest::Test
+  def setup
+    @dir = File.realpath(Dir.mktmpdir("familybranch-test-"))
+    @repo = File.join(@dir, "repo")
+    @locked = []
+    listed, = Open3.capture2("git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", chdir: ROOT)
+    listed.split("\0").select { |f| File.file?(File.join(ROOT, f)) }.each do |f|
+      FileUtils.mkdir_p(File.dirname(file(f)))
+      FileUtils.cp(File.join(ROOT, f), file(f), preserve: true)
+    end
+    git("init", "-q")
+    commit
+  end
+
+  def teardown
+    @locked.each { |dir| File.chmod(0o755, dir) }
+    FileUtils.rm_rf(@dir)
+  end
+
+  # bin/check on the working tree
+
+  def test_the_shipped_packages_pass_without_the_claude_cli
+    output, status = check
+    assert status.success?, output
+    assert_includes output, "claude not installed: skipped claude plugin validate"
+  end
+
+  def test_the_shipped_packages_pass_claude_plugin_validate
+    claude = find_tool("claude") or skip "Claude Code isn't installed"
+    output, status = check(tools: {"claude" => claude})
+    assert status.success?, output
+    refute_includes output, "skipped"
+  end
+
+  def test_a_failing_validator_fails_the_check_and_shows_why
+    claude = script("claude", "echo 'plugin.json: something the validator refuses'; echo 'Validation passed'; exit 1")
+    output, status = check(tools: {"claude" => claude})
+    refute status.success?, output
+    assert_includes output, "claude plugin validate: failed (exit 1)"
+    assert_includes output, "plugin.json: something the validator refuses"
+  end
+
+  def test_undeclared_claude_components_fail_without_the_cli
+    assert_each_claude_fixture_fails
+  end
+
+  def test_undeclared_claude_components_fail_with_the_cli
+    claude = find_tool("claude") or skip "Claude Code isn't installed"
+    assert_each_claude_fixture_fails(tools: {"claude" => claude})
+  end
+
+  def test_symlinks_and_special_files_fail_before_anything_is_read
+    replace_with_symlink("claude/skills/keep-family-records/SKILL.md", fifo)
+    replace_with_symlink("claude/skills/make-a-poster", locked_folder)
+    File.symlink(locked_folder, file("openai/assets/more"))
+    File.mkfifo(file("openai/assets/pipe"))
+    FileUtils.mv(file("skills"), file("skills-elsewhere"))
+    File.symlink(file("skills-elsewhere"), file("skills"))
+
+    output, status = check
+    refute status.success?, output
+    assert_includes output, "claude/skills/keep-family-records/SKILL.md: a symlink"
+    assert_includes output, "claude/skills/make-a-poster: a symlink"
+    assert_includes output, "openai/assets/more: a symlink"
+    assert_includes output, "openai/assets/pipe: a FIFO"
+    assert_includes output, "skills: a symlink, not a folder"
+    refute_match(/Errno|\.rb:\d+:in /, output)
+  end
+
+  # bin/package_openai on a commit
+
+  def test_a_clean_build_zips_the_six_files
+    output, status = package
+    assert status.success?, output
+    assert_equal [zip_name], dist_files
+    assert_equal OPENAI_FILES, entries(zip)
+    OPENAI_FILES.each { |f| assert_equal File.binread(file("openai/#{f}")), unzipped(f), f }
+    assert_includes output, "commit  #{git("rev-parse", "HEAD").strip}"
+    assert_match(/sha256  \h{64}/, output)
+  end
+
+  def test_files_outside_the_commit_stay_out_of_the_zip
+    committed = File.binread(file("openai/plugin.json"))
+    write("openai/notes.txt", "a draft")
+    write("openai/skills/make-a-poster/.env", "TOKEN=not-for-the-zip")
+    write("openai/plugin.json", committed.sub("Build your family tree", "Uncommitted:"))
+
+    output, status = package
+    assert status.success?, output
+    assert_includes output, "Uncommitted changes in the checkout are not in this build"
+    assert_equal OPENAI_FILES, entries(zip)
+    assert_equal committed, unzipped("plugin.json")
+  end
+
+  def test_an_unexpected_committed_file_fails
+    write("openai/notes.txt", "a draft")
+    commit
+    output, status = package
+    refute status.success?, output
+    assert_includes output, "openai/notes.txt: not in lib/inventory.rb"
+    assert_empty dist_files
+  end
+
+  def test_a_missing_committed_file_fails
+    git("rm", "-q", "openai/assets/icon.png")
+    commit
+    output, status = package
+    refute status.success?, output
+    assert_includes output, "openai/assets/icon.png: missing"
+    assert_empty dist_files
+  end
+
+  def test_committed_symlinks_fail_before_their_targets_are_read
+    replace_with_symlink("openai/skills/keep-family-records/SKILL.md", fifo)
+    replace_with_symlink("openai/skills/make-a-poster", locked_folder)
+    commit
+    output, status = package
+    refute status.success?, output
+    assert_includes output, "openai/skills/keep-family-records/SKILL.md: a symlink"
+    assert_includes output, "openai/skills/make-a-poster: a symlink"
+    refute_match(/Errno|\.rb:\d+:in /, output)
+    assert_empty dist_files
+  end
+
+  def test_a_zip_that_differs_from_the_staged_files_is_not_kept
+    real = find_tool("unzip")
+    {
+      "unzip -tq failed" => %(if [ "$1" = "-tq" ]; then echo "bad CRC" >&2; exit 2; fi; exec "#{real}" "$@"),
+      "more than once" => %(if [ "$1" = "-Z1" ]; then "#{real}" -Z1 "$2"; "#{real}" -Z1 "$2" | { IFS= read -r first; echo "$first"; }; exit 0; fi; exec "#{real}" "$@"),
+      "differs from the staged file" => %(if [ "$1" = "-p" ]; then "#{real}" "$@"; echo tampered; exit 0; fi; exec "#{real}" "$@")
+    }.each do |diagnostic, fake|
+      output, status = package(tools: {"unzip" => script("unzip", fake)})
+      refute status.success?, output
+      assert_includes output, diagnostic
+      assert_empty dist_files, diagnostic
+    end
+  end
+
+  def test_a_failed_build_leaves_the_previous_zip
+    output, status = package
+    assert status.success?, output
+    before = File.binread(zip)
+
+    write("openai/notes.txt", "a draft")
+    commit
+    output, status = package
+    refute status.success?, output
+
+    git("rm", "-q", "openai/notes.txt")
+    edit_json("openai/plugin.json") { |m| m["extensions"]["com.openai"]["publication"]["release_notes"] += " Changed." }
+    commit
+    output, status = package(tools: {"unzip" => script("unzip", "exit 2")})
+    refute status.success?, output
+
+    assert_equal [zip_name], dist_files
+    assert_equal before, File.binread(zip)
+  end
+
+  private
+
+  # Each a change bin/check must refuse, and what it must name
+  def claude_fixtures
+    manifest = "claude/.claude-plugin/plugin.json"
+    {
+      "component keys in the manifest" => lambda {
+        edit_json(manifest) do |m|
+          m["hooks"] = {"SessionStart" => [{"hooks" => [{"type" => "command", "command" => "echo hi"}]}]}
+          m["commands"] = "./commands"
+          m["mcpServers"] = {"other" => {"type" => "http", "url" => "https://example.com/mcp"}}
+        end
+        %w[hooks commands mcpServers].map { |key| "#{manifest} #{key}: not a key this release uses" }
+      },
+      "an icon outside the package" => lambda {
+        edit_json(manifest) { |m| m["icon"] = "./../openai/assets/icon.png" }
+        ["#{manifest} icon: ./assets/icon.png, the packaged icon"]
+      },
+      "an extra server" => lambda {
+        edit_json("claude/.mcp.json") { |m| m["mcpServers"]["other"] = {"type" => "http", "url" => "https://example.com/mcp"} }
+        ["claude/.mcp.json mcpServers.other: a server this plugin doesn't declare"]
+      },
+      "a changed endpoint" => lambda {
+        edit_json("claude/.mcp.json") { |m| m["mcpServers"]["familybranch"]["url"] = "https://familybranch.example/mcp" }
+        ["claude/.mcp.json mcpServers.familybranch.url:"]
+      },
+      "component files" => lambda {
+        files = %w[commands/run.md agents/helper.md hooks/hooks.json .lsp.json settings.json bin/tool]
+        files.each { |f| write("claude/#{f}", "{}") }
+        files.map { |f| "claude/#{f}: not in lib/inventory.rb" }
+      }
+    }
+  end
+
+  def assert_each_claude_fixture_fails(tools: {})
+    claude_fixtures.each do |name, apply|
+      git("reset", "-q", "--hard")
+      git("clean", "-q", "-fdx")
+      diagnostics = apply.call
+      output, status = check(tools: tools)
+      refute status.success?, "#{name} passed:\n#{output}"
+      diagnostics.each { |text| assert_includes output, text, name }
+    end
+  end
+
+  def check(tools: {}) = run_script("bin/check", tools: tools)
+
+  def package(tools: {}) = run_script("bin/package_openai", tools: tools)
+
+  # With a time limit: a script still running has opened a FIFO
+  def run_script(script, tools:)
+    env = {"PATH" => tool_folder(tools)}
+    Open3.popen2e(env, RbConfig.ruby, file(script), chdir: @repo, pgroup: true) do |stdin, out, thread|
+      stdin.close
+      reader = Thread.new { out.read }
+      unless thread.join(TIME_LIMIT)
+        Process.kill("KILL", -thread.pid)
+        flunk "#{script} was still running after #{TIME_LIMIT} seconds: it opened a file it should have refused"
+      end
+      [reader.value, thread.value]
+    end
+  end
+
+  # A folder for PATH with the scripts' tools, and the extra or replacement
+  # ones given, as symlinks
+  def tool_folder(extra)
+    folder = Dir.mktmpdir("bin-", @dir)
+    TOOLS.to_h { |name| [name, find_tool(name) || flunk("#{name} not found")] }.merge(extra).each do |name, target|
+      File.symlink(target, File.join(folder, name))
+    end
+    folder
+  end
+
+  def script(name, body)
+    path = File.join(Dir.mktmpdir("fake-", @dir), name)
+    File.write(path, "#!/bin/sh\n#{body}\n")
+    File.chmod(0o755, path)
+    path
+  end
+
+  def git(*args)
+    output, status = Open3.capture2e("git", "-c", "init.defaultBranch=main", "-c", "user.name=Test",
+      "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+      *args, chdir: @repo)
+    assert status.success?, "git #{args.join(" ")}: #{output}"
+    output
+  end
+
+  def commit
+    git("add", "-A")
+    git("commit", "-q", "--allow-empty", "-m", "Fixture")
+  end
+
+  def file(path) = File.join(@repo, path)
+
+  def write(path, text)
+    FileUtils.mkdir_p(File.dirname(file(path)))
+    File.write(file(path), text)
+  end
+
+  def edit_json(path)
+    data = JSON.parse(File.read(file(path)))
+    yield data
+    File.write(file(path), JSON.pretty_generate(data))
+  end
+
+  def replace_with_symlink(path, target)
+    FileUtils.rm_rf(file(path))
+    File.symlink(target, file(path))
+  end
+
+  def fifo
+    path = File.join(Dir.mktmpdir("trap-", @dir), "fifo")
+    File.mkfifo(path)
+    path
+  end
+
+  # Can't be listed; its SKILL.md is a FIFO
+  def locked_folder
+    folder = Dir.mktmpdir("trap-", @dir)
+    File.mkfifo(File.join(folder, "SKILL.md"))
+    File.chmod(0o111, folder)
+    @locked << folder
+    folder
+  end
+
+  def zip_name = "familybranch-openai-#{JSON.parse(git("show", "HEAD:openai/plugin.json"))["version"]}.zip"
+
+  def zip = file("dist/#{zip_name}")
+
+  def dist_files = Dir.exist?(file("dist")) ? Dir.children(file("dist")).sort : []
+
+  def entries(zip_file)
+    output, status = Open3.capture2("unzip", "-Z1", zip_file)
+    assert status.success?, output
+    output.lines.map(&:chomp).sort
+  end
+
+  def unzipped(name)
+    output, status = Open3.capture2("unzip", "-p", zip, name, binmode: true)
+    assert status.success?
+    output
+  end
+end

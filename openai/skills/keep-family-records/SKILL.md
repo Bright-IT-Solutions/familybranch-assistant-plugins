@@ -24,7 +24,9 @@ The user's own instructions come first; what follows is the default way to work.
 
 ## Notes
 
-8. Add what a record says with `append_note`, naming the source in the text: "Worked at the Lviv tram depot (1950 staff list, Lviv city archive)." Summarise rather than transcribe, one paragraph per source, and keep identity-document numbers out of the notes.
+8. Add what a record says with `append_note`, naming the source in the text: "Worked at the Lviv tram depot (1950 staff list, Lviv city archive)." Summarise rather than transcribe, one paragraph per source.
+9. For a living person, as `living` from step 1 says, record names, relationships, dates and places as the user asked. The notes are shared with the whole family, so for anything more personal, such as health, a home address or contact details, show the user the note you would save and call `append_note` only after their yes, even when they asked you to save the whole record. When they decline, leave those details out. When it isn't clear whether the person is living, ask, or leave those details out.
+10. Identity-document numbers, such as passport or national ID numbers, never go into the notes, even when the user confirms they want them there.
 
 ## Downloads
 
