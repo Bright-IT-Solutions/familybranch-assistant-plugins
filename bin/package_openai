@@ -1,13 +1,90 @@
-#!/usr/bin/env bash
-# The ZIP the OpenAI portal takes: openai/'s contents at the archive root,
-# with no macOS litter, after every check has passed.
-set -euo pipefail
-cd "$(dirname "$0")/.."
+#!/usr/bin/env ruby
+# The ZIP the OpenAI portal takes, built from a commit and never from the
+# working tree, so a stray or uncommitted file can't reach it:
+#
+#   bin/package_openai           builds HEAD
+#   bin/package_openai v1.1.0    builds that tag or commit
+#
+# The commit's files are staged in a temporary folder, and the commit's own
+# bin/check passes them. Only the files its lib/inventory.rb lists for openai/
+# go into the ZIP, which is tested, listed and compared byte for byte with
+# the staged files before it takes its versioned name in dist/. A build that
+# fails leaves a ZIP already there as it was.
+require "digest"
+require "fileutils"
+require "json"
+require "open3"
+require "rbconfig"
+require "tmpdir"
 
-bin/check
-version=$(ruby -rjson -e 'print JSON.parse(File.read("openai/plugin.json")).fetch("version")')
-zip_path="dist/familybranch-openai-$version.zip"
-mkdir -p dist
-rm -f "$zip_path"
-(cd openai && zip -q -r -X "../$zip_path" . -x '*.DS_Store' -x '__MACOSX/*')
-echo "$zip_path"
+ROOT = File.expand_path("..", __dir__)
+# Options zip and unzip would otherwise take from the environment
+ZIP_ENV = %w[ZIP ZIPOPT UNZIP UNZIPOPT ZIPINFO ZIPINFOOPT].to_h { |name| [name, nil] }.freeze
+
+def fail!(message)
+  warn "bin/package_openai: #{message}"
+  exit 1
+end
+
+def run(*command, chdir: ROOT)
+  output, status = Open3.capture2e(ZIP_ENV, *command, chdir: chdir)
+  fail!("#{command.first(2).join(" ")} failed:\n#{output}") unless status.success?
+  output
+end
+
+def verify(zip, package, files)
+  run("unzip", "-tq", zip)
+  names = run("unzip", "-Z1", zip).lines.map(&:chomp)
+  twice = names.tally.select { |_, count| count > 1 }.keys
+  fail!("the ZIP holds #{twice.join(", ")} more than once") if twice.any?
+  fail!("the ZIP holds #{names.sort.inspect}, not #{files.sort.inspect}") unless names.sort == files.sort
+  files.each do |f|
+    bytes, status = Open3.capture2(ZIP_ENV, "unzip", "-p", zip, f, binmode: true)
+    fail!("#{f} in the ZIP differs from the staged file") unless status.success? && bytes == File.binread(File.join(package, f))
+  end
+end
+
+fail!("usage: bin/package_openai [commit]") if ARGV.size > 1 || ARGV.first&.start_with?("-")
+target = ARGV.fetch(0, "HEAD")
+commit, status = Open3.capture2("git", "rev-parse", "--verify", "--quiet", "#{target}^{commit}", chdir: ROOT)
+fail!("#{target} is not a commit in this repository") unless status.success?
+commit = commit.strip
+puts "Building commit #{commit}"
+unless run("git", "status", "--porcelain", "--untracked-files=no").empty?
+  puts "Uncommitted changes in the checkout are not in this build: commit them first if they belong in it."
+end
+
+output = Dir.mktmpdir("familybranch-openai-") do |stage|
+  staged = Open3.pipeline(["git", "-C", ROOT, "archive", "--format=tar", commit], ["tar", "-x", "-f", "-", "-C", stage])
+  fail!("could not stage #{commit}") unless staged.all?(&:success?)
+
+  check = File.join(stage, "bin", "check")
+  inventory = File.join(stage, "lib", "inventory.rb")
+  fail!("#{commit} has no bin/check and lib/inventory.rb to check it with") unless File.file?(check) && File.file?(inventory)
+  system(RbConfig.ruby, check) or fail!("#{commit} doesn't pass its bin/check")
+
+  load inventory
+  files = INVENTORY.fetch("openai")
+  package = File.join(stage, "openai")
+  files.each { |f| fail!("openai/#{f} is not a regular file") unless File.lstat(File.join(package, f)).file? }
+  version = JSON.parse(File.read(File.join(package, "plugin.json"))).fetch("version").to_s
+  fail!("version #{version.inspect} is not x.y.z") unless version.match?(/\A\d+\.\d+\.\d+\z/)
+
+  dist = File.join(ROOT, "dist")
+  FileUtils.mkdir_p(dist)
+  final = File.join(dist, "familybranch-openai-#{version}.zip")
+  partial = File.join(dist, ".familybranch-openai-#{version}-#{Process.pid}.zip")
+  begin
+    # -D: no folder entries, so the ZIP holds exactly the listed files
+    run("zip", "-q", "-X", "-D", partial, *files, chdir: package)
+    verify(partial, package, files)
+    File.rename(partial, final)
+  ensure
+    FileUtils.rm_f(partial)
+  end
+  final
+end
+
+puts "dist/#{File.basename(output)}"
+puts "  commit  #{commit}"
+puts "  sha256  #{Digest::SHA256.file(output).hexdigest}"
